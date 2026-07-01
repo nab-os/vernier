@@ -14,33 +14,34 @@
 #include "MegarenaPatternLayout.hpp"
 #include "HPCodePatternLayout.hpp"
 #include "CustomPatternLayout.hpp"
+#include <memory>
 
 namespace vernier {
 
     class Layout {
     public:
 
-        static PatternLayout * newInstance(const std::string& classname) {
-            PatternLayout* layout;
+        static std::unique_ptr<PatternLayout> newInstance(const std::string& classname) {
+            std::unique_ptr<PatternLayout> layout;
             if (classname == "PeriodicPattern") {
-                layout = new PeriodicPatternLayout();
+                layout.reset(new PeriodicPatternLayout());
             } else if (classname == "BitmapPattern") {
-                layout = new BitmapPatternLayout();
+                layout.reset(new BitmapPatternLayout());
             } else if (classname == "FingerprintPattern") {
-                layout = new FingerprintPatternLayout();
+                layout.reset(new FingerprintPatternLayout());
             } else if (classname == "MegarenaPattern") {
-                layout = new MegarenaPatternLayout();
+                layout.reset(new MegarenaPatternLayout());
             } else if (classname == "HPCodePattern") {
-                layout = new HPCodePatternLayout();
+                layout.reset(new HPCodePatternLayout());
             } else if (classname == "CustomPattern") {
-                layout = new CustomPatternLayout();
+                layout.reset(new CustomPatternLayout());
             } else {
                 throw Exception(classname + " is not a valid class name for a pattern layout.");
             }
             return layout;
         }
 
-        static PatternLayout * loadFromJSON(const std::string& filename) {
+        static std::unique_ptr<PatternLayout> loadFromJSON(const std::string& filename) {
             BufferedReader bufferedReader(filename);
             rapidjson::Document document;
             document.ParseInsitu(bufferedReader.data());
@@ -51,7 +52,7 @@ namespace vernier {
                 throw Exception(filename + " is empty.");
             }
             std::string classname = document.MemberBegin()->name.GetString();
-            PatternLayout* layout = newInstance(classname);
+            std::unique_ptr<PatternLayout> layout = newInstance(classname);
             layout->readJSON(document.MemberBegin()->value);
             return layout;
         }
