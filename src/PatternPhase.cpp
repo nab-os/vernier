@@ -25,12 +25,17 @@ namespace vernier {
             spectrum.resize(nRows, nCols);
             spectrumShifted.resize(nRows, nCols);
             spectrumFiltered1.resize(nRows, nCols);
-            spectrumFiltered1.resize(nRows, nCols);
+            spectrumFiltered2.resize(nRows, nCols);
             phase1.resize(nRows, nCols);
             phase2.resize(nRows, nCols);
             unwrappedPhase1.resize(nRows, nCols);
             unwrappedPhase2.resize(nRows, nCols);
             spatial.resize(nRows, nCols);
+#ifdef USE_CUDA
+            if (cudaEngine) {
+                cudaEngine->resize(nRows, nCols);
+            }
+#endif
         }
     }
 
@@ -51,6 +56,12 @@ namespace vernier {
     }
 
     void PatternPhase::compute() {
+#ifdef USE_CUDA
+        if (backend == Backend::CUDA) {
+            computeCuda();
+            return;
+        }
+#endif
         fft.compute(spatial, spectrum);
 
         shift(spectrum, spectrumShifted);
@@ -69,16 +80,13 @@ namespace vernier {
         unwrappedPhase1 = phase1.arg();
         quartersUnwrapPhase(unwrappedPhase1);
 
-        // Compute unwrapped plase from peak 2
+        // Compute unwrapped phase from peak 2
         applyGaussianFilter(spectrumFiltered2, mainPeak2(1), mainPeak2(0), sigma);
         ifft.compute(spectrumFiltered2, phase2);
         shift(phase2);
 
         unwrappedPhase2 = phase2.arg();
         quartersUnwrapPhase(unwrappedPhase2);
-
-        plane1 = regressionPlane.compute(unwrappedPhase1);
-        plane2 = regressionPlane.compute(unwrappedPhase2);
     }
 
     void PatternPhase::peaksSearch(Eigen::ArrayXXd& source, Eigen::Vector3d& mainPeak1, Eigen::Vector3d& mainPeak2) {
@@ -131,6 +139,7 @@ namespace vernier {
         cv::Mat phase1img(phaseCropped.rows(), phaseCropped.cols(), CV_64FC1, phaseCropped.data());
         cv::Mat phaseResult(phase1img.rows, phase1img.cols, CV_64FC1);
 
+        PhasePlane plane1 = getPlane1();
         double a = plane1.getA();
         double b = plane1.getB();
 
@@ -162,6 +171,7 @@ namespace vernier {
         phase2img.convertTo(phase2BGR, CV_8UC3);
         cv::cvtColor(phase2BGR, phase2BGR, cv::COLOR_GRAY2BGR);
 
+        PhasePlane plane2 = getPlane1();
         a = plane2.getA();
         b = plane2.getB();
 
@@ -175,8 +185,8 @@ namespace vernier {
         //cv::imshow("phase 2", phase2HSV);
         //cv::imwrite("D:/Nextcloud2/classic3Dpatterns/analysis_scripts/perspectivePhaseEvolution/phaseMap.png", phase2HSV);
 
-        for (int i = 0; i < phase1img.rows - 1; i++) {
-            for (int j = 0; j < phase1img.cols - 1; j++) {
+        for (int i = 0; i < phase2img.rows - 1; i++) {
+            for (int j = 0; j < phase2img.cols - 1; j++) {
                 double dXdV = -(phaseCropped(i + 1, j) - phaseCropped(i, j)) * a / (pow(a, 2) + pow(b, 2));
                 double dYdV = (phaseCropped(i, j + 1) - phaseCropped(i, j)) * b / (pow(a, 2) + pow(b, 2));
                 phaseDerived.at<double>(i, j) = dXdV + dYdV;
@@ -255,6 +265,58 @@ namespace vernier {
     bool PatternPhase::peaksFound() {
         return (mainPeak1.z() > minPeakPower && mainPeak2.z() > minPeakPower);
     }
+
+    void PatternPhase::setBackend(Backend backend) {
+#ifdef USE_CUDA
+        if (backend == Backend::CUDA) {
+            if (!CudaPhaseEngine::available()) {
+                throw Exception("CUDA backend requested but no CUDA device is available.");
+            }
+            if (!cudaEngine) {
+                cudaEngine.reset(new CudaPhaseEngine());
+            }
+            if (spectrum.rows() > 0 && spectrum.cols() > 0) {
+                cudaEngine->resize(spectrum.rows(), spectrum.cols());
+            }
+        }
+        this->backend = backend;
+#else
+        if (backend == Backend::CUDA) {
+            throw Exception("CUDA backend requested but the library was built without USE_CUDA.");
+        }
+        this->backend = backend;
+#endif
+    }
+
+    Backend PatternPhase::getBackend() const {
+        return backend;
+    }
+
+    bool PatternPhase::cudaAvailable() {
+#ifdef USE_CUDA
+        return CudaPhaseEngine::available();
+#else
+        return false;
+#endif
+    }
+
+#ifdef USE_CUDA
+    void PatternPhase::computeCuda() {
+        double p1[3], p2[3];
+        // The engine runs the whole data-parallel pipeline on the GPU and writes the
+        // wrapped phases (arg) into unwrappedPhase1/2; the sequential unwrap stays here.
+        cudaEngine->compute(spatial.data(), sigma, minPeakPower, minFrequency, maxFrequency,
+                smoothingKernelSize,
+                spectrumShifted.data(), phase1.data(), phase2.data(),
+                unwrappedPhase1.data(), unwrappedPhase2.data(), p1, p2);
+
+        mainPeak1 << p1[0], p1[1], p1[2];
+        mainPeak2 << p2[0], p2[1], p2[2];
+
+        quartersUnwrapPhase(unwrappedPhase1);
+        quartersUnwrapPhase(unwrappedPhase2);
+    }
+#endif
 
     cv::Mat PatternPhase::getImage() {
         cv::Mat image;
@@ -347,7 +409,7 @@ namespace vernier {
     }
 
     double PatternPhase::getPixelPeriod() {
-        return plane1.getPixelicPeriod();
+        return getPlane1().getPixelicPeriod();
     }
 
     int PatternPhase::getNRows() {
@@ -359,23 +421,17 @@ namespace vernier {
     }
 
     void PatternPhase::rotate90() {
-        std::swap(plane1, plane2);
         std::swap(unwrappedPhase1, unwrappedPhase2);
-        plane1.flip();
         unwrappedPhase1 *= -1.0;
     }
 
     void PatternPhase::rotate180() {
-        plane1.flip();
-        plane2.flip();
         unwrappedPhase1 *= -1.0;
         unwrappedPhase2 *= -1.0;
     }
 
     void PatternPhase::rotate270() {
-        std::swap(plane1, plane2);
         std::swap(unwrappedPhase1, unwrappedPhase2);
-        plane2.flip();
         unwrappedPhase2 *= -1.0;
     }
 
